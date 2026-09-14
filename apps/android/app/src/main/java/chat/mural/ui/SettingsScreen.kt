@@ -134,7 +134,7 @@ fun SettingsScreen(vm: MuralViewModel, onExport: () -> Unit, onImport: () -> Uni
                                 enabled = !vm.isRunning, tint = MuralColors.Secondary, chevron = true, onClick = { keyDialog = true })
                             SettingsDivider()
                             SettingsRow(stringResource(R.string.settings_open_api_keys), tint = MuralColors.Secondary,
-                                onClick = { open("https://platform.openai.com/api-keys") })
+                                onClick = { open("https://aistudio.google.com/app/apikey") })
                             if (vm.hasKey) {
                                 SettingsDivider()
                                 SettingsRow(stringResource(R.string.settings_remove_key), enabled = !vm.isRunning,
@@ -161,7 +161,7 @@ fun SettingsScreen(vm: MuralViewModel, onExport: () -> Unit, onImport: () -> Uni
                     SettingsRow(stringResource(R.string.settings_search_calls_label), usage.searchCalls.toString())
                     SettingsDivider()
                     SettingsRow(stringResource(R.string.settings_usage_billing_link), tint = MuralColors.Secondary,
-                        onClick = { open("https://platform.openai.com/usage") })
+                        onClick = { open("https://ai.google.dev/gemini-api/docs/billing") })
                 }
             }
             item {
@@ -202,7 +202,7 @@ fun SettingsScreen(vm: MuralViewModel, onExport: () -> Unit, onImport: () -> Uni
                     }
                     SettingsDivider()
                     SettingsRow(stringResource(R.string.settings_openai_data_controls), tint = MuralColors.Secondary,
-                        onClick = { open("https://developers.openai.com/api/docs/guides/your-data") })
+                        onClick = { open("https://ai.google.dev/gemini-api/docs/data-governance") })
                     Text(stringResource(R.string.settings_data_use_footer), style = MaterialTheme.typography.bodySmall,
                         color = MuralColors.Secondary, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
                     SettingsDivider()

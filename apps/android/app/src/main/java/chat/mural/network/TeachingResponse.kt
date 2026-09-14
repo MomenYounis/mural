@@ -4,8 +4,40 @@ import chat.mural.core.SourceLink
 import java.net.URI
 import kotlinx.serialization.json.*
 
-/** Decodes direct Responses output and retains only safe citations. */
+/** Decodes direct Responses output and retains only safe citations. Supports both Gemini and legacy OpenAI formats. */
 internal fun decodeTeachingResponse(response: JsonObject): APIResult {
+    // Try Gemini format first: candidates
+    if ("candidates" in response) {
+        val candidates = response["candidates"] as? JsonArray ?: throw APIClient.APIException.InvalidResponse
+        if (candidates.isEmpty()) throw APIClient.APIException.Incomplete
+        val first = candidates[0] as? JsonObject ?: throw APIClient.APIException.InvalidResponse
+        val content = first["content"] as? JsonObject ?: throw APIClient.APIException.InvalidResponse
+        val parts = content["parts"] as? JsonArray ?: throw APIClient.APIException.InvalidResponse
+        val text = StringBuilder()
+        for (p in parts) {
+            val obj = p as? JsonObject ?: continue
+            (obj["text"] as? JsonPrimitive)?.contentOrNull?.let { text.append(it) }
+        }
+        if (text.isEmpty()) throw APIClient.APIException.Incomplete
+        val usage = response["usageMetadata"] as? JsonObject
+        val sources = mutableListOf<SourceLink>()
+        val grounding = first["groundingMetadata"] as? JsonObject
+        val chunks = grounding?.get("groundingChunks") as? JsonArray
+        if (chunks != null) {
+            for (chunk in chunks) {
+                val c = chunk as? JsonObject ?: continue
+                val web = c["web"] as? JsonObject ?: continue
+                val uri = web["uri"]?.let { (it as? JsonPrimitive)?.contentOrNull } ?: continue
+                val title = web["title"]?.let { (it as? JsonPrimitive)?.contentOrNull } ?: "Source"
+                if (isSafeSourceUrl(uri) && sources.none { it.url == uri }) sources.add(SourceLink(title, uri))
+            }
+        }
+        val input = ((usage?.get("promptTokenCount") as? JsonPrimitive)?.intOrNull ?: 0).coerceIn(0, 1_000_000_000)
+        val output = ((usage?.get("candidatesTokenCount") as? JsonPrimitive)?.intOrNull ?: 0).coerceIn(0, 1_000_000_000)
+        return APIResult(text.toString(), sources, APIUsage(input, output, if (grounding != null) 1 else 0))
+    }
+
+    // Legacy OpenAI format
     if (response.string("status") != "completed") throw APIClient.APIException.Incomplete
 
     val text = StringBuilder()

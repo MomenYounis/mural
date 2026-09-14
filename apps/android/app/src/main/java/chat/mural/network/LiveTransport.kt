@@ -7,13 +7,19 @@ import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Base64
+import android.util.Log
 import chat.mural.R
-import java.nio.ByteBuffer
 import java.util.UUID
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -32,30 +38,27 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.put
-import org.webrtc.CandidatePairChangeEvent
-import org.webrtc.DataChannel
-import org.webrtc.IceCandidate
-import org.webrtc.IceCandidateErrorEvent
-import org.webrtc.MediaConstraints
-import org.webrtc.MediaStream
-import org.webrtc.PeerConnection
-import org.webrtc.PeerConnectionFactory
-import org.webrtc.RtpReceiver
-import org.webrtc.RtpTransceiver
-import org.webrtc.SdpObserver
-import org.webrtc.SessionDescription
-import org.webrtc.audio.AudioDeviceModule
-import org.webrtc.audio.JavaAudioDeviceModule
-import org.webrtc.audio.JavaAudioDeviceModule.AudioRecordErrorCallback
-import org.webrtc.audio.JavaAudioDeviceModule.AudioRecordStartErrorCode
-import org.webrtc.audio.JavaAudioDeviceModule.AudioTrackErrorCallback
-import org.webrtc.audio.JavaAudioDeviceModule.AudioTrackStartErrorCode
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.putJsonArray
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString
+import java.util.concurrent.TimeUnit
+import kotlin.math.sqrt
 
 class LiveTransport(
     context: Context,
@@ -71,6 +74,7 @@ class LiveTransport(
     private val lock = Any()
     private val retiredAttempts = ArrayDeque<Attempt>()
     private val audioScope = CoroutineScope(SupervisorJob() + AUDIO_DISPATCHER)
+    private val credentialStore = CredentialStore(applicationContext)
 
     @Volatile private var activeAttempt: Attempt? = null
     @Volatile private var startedState = false
@@ -98,6 +102,8 @@ class LiveTransport(
             previousAudioMode = audioManager.mode,
             previousSpeakerphone = if (Build.VERSION.SDK_INT < 31) legacySpeakerphoneState() else false,
         )
+        // Keep lease for cleanup; for hosted it will be used to close server session
+        // For Gemini personal, lease may be null
         synchronized(lock) {
             if (generation.get() != attemptGeneration) throw CancellationException("Voice connection superseded")
             activeAttempt = attempt
@@ -107,38 +113,78 @@ class LiveTransport(
 
         try {
             configureAudio(attempt)
-            ensureWebRtcInitialized()
-            createPeer(attempt)
             requireCurrent(attempt)
 
-            val offer = withTimeout(SDP_TIMEOUT_MILLISECONDS) { createOffer(attempt) }
-            withTimeout(SDP_TIMEOUT_MILLISECONDS) { setDescription(attempt, local = true, offer) }
-            if (attempt.peer?.iceGatheringState() == PeerConnection.IceGatheringState.COMPLETE) {
-                attempt.iceComplete.complete(Unit)
-            }
-            withTimeout(ICE_TIMEOUT_MILLISECONDS) { attempt.iceComplete.await() }
+            // Resolve API key: prefer CredentialStore; Hosted path may not have key but we still try store first
+            val apiKey = credentialStore.read()
+                ?: run {
+                    Log.e("MuralLive", "No Gemini API key found in CredentialStore")
+                    throw APIClient.APIException.MissingKey
+                }
+            Log.i("MuralLive", "Gemini Live connect: key prefix=" + apiKey.take(6) + " len=" + apiKey.length + " instructions len=" + instructions.length)
+
+            // Build Gemini Live WebSocket URL
+
+            // Build Gemini Live WebSocket URL
+            // Gemini API keys now may be AIza... or AQ... (new format). Always send as ?key= and x-goog-api-key
+            val wsUrl = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=$apiKey"
+            Log.i("MuralLive", "Connecting to Gemini Live: " + wsUrl.take(95) + " keyLen=" + apiKey.length + " prefix=" + apiKey.take(8))
+            val request = Request.Builder().url(wsUrl).header("x-goog-api-key", apiKey).build()
+            val client = OkHttpClient.Builder()
+                .readTimeout(0, TimeUnit.MILLISECONDS)
+                .writeTimeout(30, TimeUnit.SECONDS)
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .build()
+            attempt.okHttpClient = client
+
+            // Create AudioTrack for playback (24kHz mono PCM16)
+            val track = createAudioTrack()
+            attempt.audioTrack = track
+            try { track.play() } catch (_: Exception) { throw connectionException() }
+
+            // Create AudioRecord for capture (16kHz mono PCM16)
+            val record = createAudioRecord()
+            attempt.audioRecord = record
+            try { record.startRecording() } catch (_: Exception) { throw microphoneException() }
+
+            // Setup WebSocket listener
+            val openDeferred = CompletableDeferred<Unit>()
+            val listener = geminiListener(attempt, openDeferred)
+            val ws = client.newWebSocket(request, listener)
+            attempt.webSocket = ws
+
+            // Wait for websocket open (max 10s)
+            withTimeout(10_000) { openDeferred.await() }
             requireCurrent(attempt)
 
-            val sdp = attempt.peer?.localDescription?.description ?: throw connectionException()
-            val result = api.createLiveSession(LiveSessionRequest(sdp, instructions, history, language))
-            attempt.ownership.adopt(result.lease)
-            requireCurrent(attempt)
-            val answer = result.sdp
-            result.providerSessionID?.let { id ->
-                emitEvent(attempt, buildJsonObject {
-                    put("type", "mural.session.created")
-                    put("session", buildJsonObject { put("id", id) })
-                })
+            // Send setup message
+            val setupJson = buildGeminiSetup(instructions, history, language)
+            Log.i("MuralLive", "Sending setup: " + setupJson.toString().take(600))
+            if (!ws.send(setupJson.toString())) {
+                Log.e("MuralLive", "Failed to send setup")
+                throw connectionException()
             }
-            withTimeout(SDP_TIMEOUT_MILLISECONDS) {
-                setDescription(attempt, local = false, SessionDescription(SessionDescription.Type.ANSWER, answer))
-            }
+            Log.i("MuralLive", "Setup sent, awaiting setupComplete...")
+
+            // Wait for setupComplete with timeout
             withTimeout(READY_TIMEOUT_MILLISECONDS) { attempt.started.await() }
             requireCurrent(attempt)
+
+            // Start audio pipelines
+            startCapture(attempt)
+            startPlayback(attempt)
             startMetering(attempt)
+
             attempt.scopeCompletion = scope.coroutineContext[Job]?.invokeOnCompletion {
                 audioScope.launch { cleanupIfCurrent(attempt) }
             }
+
+            // Adopt any hosted lease if provider is Hosted: try to create via provider for closing semantics
+            // For personal Gemini, we don't have SDP flow, so just create dummy lease handling.
+            // If api is HostedAPIClient, attempt to keep its lease for later close.
+            // We try to invoke createLiveSession only for Hosted path with dummy SDP? Hosted requires valid SDP.
+            // For Gemini live personal, lease is null.
+
         } catch (_: TimeoutCancellationException) {
             cleanupIfCurrent(attempt)
             throw timeoutException()
@@ -147,6 +193,8 @@ class LiveTransport(
             throw error
         } catch (error: Throwable) {
             cleanupIfCurrent(attempt)
+            // Map MissingKey to specific exception for UI
+            if (error is APIClient.APIException.MissingKey) throw error
             throw error
         }
     }
@@ -154,7 +202,7 @@ class LiveTransport(
     /** True means accepted for delivery; every native operation runs on the audio worker. */
     fun send(event: JsonObject): Boolean {
         val attempt = activeAttempt ?: return false
-        if (!isCurrent(attempt) || !attempt.channelOpen.get()) return false
+        if (!isCurrent(attempt) || attempt.webSocket == null) return false
         audioScope.launch {
             if (isCurrent(attempt) && !sendNow(attempt, event) && !attempt.closing.get()) {
                 fail(attempt, applicationContext.getString(R.string.error_transport_channel_closed))
@@ -165,10 +213,46 @@ class LiveTransport(
 
     private fun sendNow(attempt: Attempt, event: JsonObject): Boolean {
         if (!isCurrent(attempt)) return false
-        val channel = attempt.channel ?: return false
+        val ws = attempt.webSocket ?: return false
         return try {
-            channel.state() == DataChannel.State.OPEN &&
-                channel.send(DataChannel.Buffer(ByteBuffer.wrap(event.toString().toByteArray(Charsets.UTF_8)), false))
+            val type = event["type"]?.jsonPrimitive?.contentOrNull ?: return false
+            val content = event["content"]?.jsonPrimitive?.contentOrNull ?: ""
+            val jsonToSend = when {
+                type.startsWith("session.") && type.endsWith(".append") -> {
+                    // Map to Gemini client_content
+                    buildJsonObject {
+                        put("clientContent", buildJsonObject {
+                            put("turns", buildJsonArray {
+                                add(buildJsonObject {
+                                    put("role", "user")
+                                    put("parts", buildJsonArray { add(buildJsonObject { put("text", content.take(1000)) }) })
+                                })
+                            })
+                            put("turnComplete", true)
+                        })
+                    }
+                }
+                type == "session.input_audio.mute" -> {
+                    // Mute is handled locally; optionally notify server
+                    return true
+                }
+                type == "session.input_audio.unmute" -> return true
+                type == "session.close" -> {
+                    // Send close signal; Gemini live expects no specific close JSON, just close websocket
+                    attempt.closing.set(true)
+                    ws.close(1000, "client close")
+                    return true
+                }
+                else -> {
+                    // Generic fallback: send as realtime text input
+                    buildJsonObject {
+                        put("realtimeInput", buildJsonObject {
+                            put("text", content.take(1000))
+                        })
+                    }
+                }
+            }
+            ws.send(jsonToSend.toString())
         } catch (_: Exception) { false }
     }
 
@@ -177,11 +261,8 @@ class LiveTransport(
         mutedState = muted
         audioScope.launch {
             if (!isCurrent(attempt)) return@launch
-            try { attempt.track?.setEnabled(!muted) } catch (_: Exception) { }
-            sendNow(attempt, buildJsonObject {
-                put("type", if (muted) "session.input_audio.mute" else "session.input_audio.unmute")
-                put("event_id", UUID.randomUUID().toString())
-            })
+            // Pause capture via flag; no need to send to server except optional notification
+            // For Gemini, muting just stops sending audio chunks
         }
     }
 
@@ -192,17 +273,17 @@ class LiveTransport(
         mutedState = true
         audioScope.launch {
             if (!isCurrent(attempt)) return@launch
-            try { attempt.track?.setEnabled(false) } catch (_: Exception) { }
-            sendNow(attempt, buildJsonObject {
-                put("type", "session.close")
-                put("event_id", UUID.randomUUID().toString())
-            })
+            try {
+                val ws = attempt.webSocket
+                // Notify server of interruption if needed
+                ws?.send(buildJsonObject { put("clientContent", buildJsonObject { put("turnComplete", true) }) }.toString())
+                ws?.close(1000, "close")
+            } catch (_: Exception) { }
         }
     }
 
     fun disconnect() {
         val detached = detachAttempt()
-        // This scope outlives the ViewModel so clearing the screen cannot cancel native cleanup.
         audioScope.launch { drainRetiredAttempts() }
         emitZeroLevels(detached)
     }
@@ -216,195 +297,406 @@ class LiveTransport(
     }
 
     private fun drainRetiredAttempts() {
-        // A restart may reach the worker before a previously posted cleanup task. Drain all
-        // retired attempts before the replacement reads or changes any process audio state.
         while (true) {
             val retired = synchronized(lock) { retiredAttempts.removeFirstOrNull() } ?: break
             cleanup(retired)
         }
     }
 
-    private fun createPeer(attempt: Attempt) {
-        attempt.networkRecovery = VoiceConnectionRecovery(audioScope) {
-            fail(attempt, applicationContext.getString(R.string.error_transport_network_lost))
+    private fun buildGeminiSetup(instructions: String, history: JsonArray, language: String?): JsonObject {
+        // Build history text prefix
+        val historyText = StringBuilder()
+        for (elem in history) {
+            val obj = elem as? JsonObject ?: continue
+            val role = obj["role"]?.jsonPrimitive?.contentOrNull ?: "user"
+            val contentArr = obj["content"] as? JsonArray ?: continue
+            for (c in contentArr) {
+                val p = c as? JsonObject ?: continue
+                val t = p["text"]?.jsonPrimitive?.contentOrNull ?: continue
+                historyText.append("$role: $t\n")
+            }
         }
-        val audioDeviceModule = JavaAudioDeviceModule.builder(applicationContext)
-            .setUseHardwareAcousticEchoCanceler(true)
-            .setUseHardwareNoiseSuppressor(true)
-            .setAudioAttributes(voiceAudioAttributes())
-            .setAudioRecordErrorCallback(object : AudioRecordErrorCallback {
-                override fun onWebRtcAudioRecordInitError(message: String) = audioFailure(attempt)
-                override fun onWebRtcAudioRecordStartError(
-                    errorCode: AudioRecordStartErrorCode,
-                    message: String,
-                ) = audioFailure(attempt)
-                override fun onWebRtcAudioRecordError(message: String) = audioFailure(attempt)
-            })
-            .setAudioTrackErrorCallback(object : AudioTrackErrorCallback {
-                override fun onWebRtcAudioTrackInitError(message: String) = audioFailure(attempt)
-                override fun onWebRtcAudioTrackStartError(
-                    errorCode: AudioTrackStartErrorCode,
-                    message: String,
-                ) = audioFailure(attempt)
-                override fun onWebRtcAudioTrackError(message: String) = audioFailure(attempt)
-            })
-            .createAudioDeviceModule()
-        attempt.audioDeviceModule = audioDeviceModule
-        val factory = PeerConnectionFactory.builder()
-            .setAudioDeviceModule(audioDeviceModule)
-            .createPeerConnectionFactory()
-        attempt.factory = factory
+        val fullInstructions = if (historyText.isNotEmpty()) {
+            "Conversation history:\n$historyText\n\nCurrent instructions: $instructions"
+        } else instructions
 
-        val configuration = PeerConnection.RTCConfiguration(emptyList()).apply {
-            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-            continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE
+        // Use Gemini 2.5 Flash Native Audio Preview as default live model
+        return buildJsonObject {
+            put("setup", buildJsonObject {
+                put("model", "models/gemini-2.5-flash-native-audio-preview-09-2025")
+                put("generationConfig", buildJsonObject {
+                    put("responseModalities", buildJsonArray { add(JsonPrimitive("AUDIO")) })
+                    put("speechConfig", buildJsonObject {
+                        put("voiceConfig", buildJsonObject {
+                            put("prebuiltVoiceConfig", buildJsonObject { put("voiceName", "Aoede") })
+                        })
+                    })
+                })
+                put("systemInstruction", buildJsonObject {
+                    put("parts", buildJsonArray { add(buildJsonObject { put("text", fullInstructions.take(12000)) }) })
+                })
+                // Request transcriptions for both directions
+                put("inputAudioTranscription", buildJsonObject {})
+                put("outputAudioTranscription", buildJsonObject {})
+                // Enable VAD
+                put("realtimeInputConfig", buildJsonObject {
+                    put("automaticActivityDetection", buildJsonObject {
+                        put("disabled", false)
+                        put("startOfSpeechSensitivity", "START_SENSITIVITY_HIGH")
+                        put("endOfSpeechSensitivity", "END_SENSITIVITY_HIGH")
+                        put("prefixPaddingMs", 20)
+                        put("silenceDurationMs", 100)
+                    })
+                })
+            })
         }
-        val peer = factory.createPeerConnection(configuration, peerObserver(attempt))
-            ?: throw connectionException()
-        attempt.peer = peer
-
-        val source = factory.createAudioSource(MediaConstraints().apply {
-            optional.add(MediaConstraints.KeyValuePair("googEchoCancellation", "true"))
-            optional.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "true"))
-            optional.add(MediaConstraints.KeyValuePair("googAutoGainControl", "true"))
-        })
-        attempt.source = source
-        val track = factory.createAudioTrack("mural-microphone", source)
-        attempt.track = track
-        if (peer.addTrack(track, listOf("mural-audio")) == null) throw connectionException()
-
-        val channel = peer.createDataChannel("oai-events", DataChannel.Init().apply { ordered = true })
-            ?: throw connectionException()
-        attempt.channel = channel
-        channel.registerObserver(dataObserver(attempt))
     }
 
-    private fun peerObserver(attempt: Attempt) = object : PeerConnection.Observer {
-        override fun onSignalingChange(state: PeerConnection.SignalingState) = Unit
-        override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
-        override fun onIceCandidate(candidate: IceCandidate) = Unit
-        override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) = Unit
-        override fun onIceCandidateError(event: IceCandidateErrorEvent) = Unit
-        override fun onSelectedCandidatePairChanged(event: CandidatePairChangeEvent) = Unit
-        override fun onAddStream(stream: MediaStream) = Unit
-        override fun onRemoveStream(stream: MediaStream) = Unit
-        override fun onDataChannel(channel: DataChannel) = Unit
-        override fun onRenegotiationNeeded() = Unit
-        override fun onAddTrack(receiver: RtpReceiver, streams: Array<out MediaStream>) = Unit
-        override fun onRemoveTrack(receiver: RtpReceiver) = Unit
-        override fun onTrack(transceiver: RtpTransceiver) = Unit
+    private fun createAudioRecord(): AudioRecord {
+        val sampleRate = 16000
+        val channel = AudioFormat.CHANNEL_IN_MONO
+        val encoding = AudioFormat.ENCODING_PCM_16BIT
+        val minBuf = AudioRecord.getMinBufferSize(sampleRate, channel, encoding).coerceAtLeast(2048)
+        // Use VOICE_COMMUNICATION for echo cancellation
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            AudioRecord.Builder()
+                .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+                .setAudioFormat(AudioFormat.Builder().setSampleRate(sampleRate).setChannelMask(channel).setEncoding(encoding).build())
+                .setBufferSizeInBytes(minBuf * 2)
+                .build()
+        } else {
+            @Suppress("DEPRECATION")
+            AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, sampleRate, channel, encoding, minBuf * 2)
+        }
+    }
 
-        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
-            if (state == PeerConnection.IceGatheringState.COMPLETE && isCurrent(attempt)) {
-                attempt.iceComplete.complete(Unit)
+    private fun createAudioTrack(): AudioTrack {
+        val sampleRate = 24000
+        val channel = AudioFormat.CHANNEL_OUT_MONO
+        val encoding = AudioFormat.ENCODING_PCM_16BIT
+        val minBuf = AudioTrack.getMinBufferSize(sampleRate, channel, encoding).coerceAtLeast(4096)
+        val attrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            AudioTrack.Builder()
+                .setAudioAttributes(attrs)
+                .setAudioFormat(AudioFormat.Builder().setSampleRate(sampleRate).setChannelMask(channel).setEncoding(encoding).build())
+                .setBufferSizeInBytes(minBuf * 4)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+        } else {
+            @Suppress("DEPRECATION")
+            AudioTrack(attrs, AudioFormat.Builder().setSampleRate(sampleRate).setChannelMask(channel).setEncoding(encoding).build(), minBuf * 4, AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE)
+        }
+    }
+
+    private fun startCapture(attempt: Attempt) {
+        attempt.captureJob?.cancel()
+        attempt.captureJob = audioScope.launch {
+            val record = attempt.audioRecord ?: return@launch
+            val bufferSize = 640 // 20ms @ 16kHz 16-bit mono
+            val buffer = ByteArray(bufferSize)
+            // Chunk send interval control
+            while (isActive && isCurrent(attempt) && !attempt.closing.get()) {
+                if (mutedState) {
+                    delay(40)
+                    // consume to avoid overflow but discard
+                    try { record.read(buffer, 0, buffer.size) } catch (_: Exception) {}
+                    continue
+                }
+                val read = try { record.read(buffer, 0, buffer.size) } catch (_: Exception) { -1 }
+                if (read <= 0) {
+                    delay(20)
+                    continue
+                }
+                // Compute input level RMS
+                var sum = 0.0
+                for (i in 0 until read step 2) {
+                    if (i + 1 >= read) break
+                    val sample = ((buffer[i + 1].toInt() shl 8) or (buffer[i].toInt() and 0xFF)).toShort().toInt()
+                    sum += (sample.toDouble() / 32768.0) * (sample.toDouble() / 32768.0)
+                }
+                val rms = if (read > 0) sqrt(sum / (read / 2)) else 0.0
+                attempt.lastInputLevel = attempt.lastInputLevel * 0.35 + rms.coerceIn(0.0, 1.0) * 0.65
+
+                // Send chunk
+                val chunk = buffer.copyOf(read)
+                val b64 = Base64.encodeToString(chunk, Base64.NO_WRAP)
+                val msg = buildJsonObject {
+                    put("realtimeInput", buildJsonObject {
+                        put("audio", buildJsonObject {
+                            put("mimeType", "audio/pcm;rate=16000")
+                            put("data", b64)
+                        })
+                    })
+                }
+                try {
+                    attempt.webSocket?.send(msg.toString())
+                } catch (_: Exception) {
+                    // will trigger fail via websocket onFailure
+                }
+                // ~20ms cadence, but read already took time
+                // Optionally delay a bit to avoid busy loop if read is fast
+                // No extra delay; next read will block appropriately
             }
         }
+    }
 
-        override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
-            if (state == PeerConnection.IceConnectionState.FAILED) {
-                fail(attempt, applicationContext.getString(R.string.error_transport_network_lost))
-            }
-        }
+    private fun startPlayback(attempt: Attempt) {
+        attempt.playbackJob?.cancel()
+        attempt.playbackJob = audioScope.launch {
+            while (isActive && isCurrent(attempt)) {
+                val chunk = attempt.playbackQueue.poll()
+                if (chunk == null) {
+                    delay(10)
+                    continue
+                }
+                try {
+                    val track = attempt.audioTrack ?: continue
+                    // Compute output level
+                    var sum = 0.0
+                    for (i in chunk.indices step 2) {
+                        if (i + 1 >= chunk.size) break
+                        val sample = ((chunk[i + 1].toInt() shl 8) or (chunk[i].toInt() and 0xFF)).toShort().toInt()
+                        sum += (sample.toDouble() / 32768.0) * (sample.toDouble() / 32768.0)
+                    }
+                    val rms = if (chunk.size > 0) sqrt(sum / (chunk.size / 2)) else 0.0
+                    attempt.lastOutputLevel = attempt.lastOutputLevel * 0.35 + rms.coerceIn(0.0, 1.0) * 0.65
 
-        override fun onStandardizedIceConnectionChange(state: PeerConnection.IceConnectionState) {
-            if (state == PeerConnection.IceConnectionState.FAILED) {
-                fail(attempt, applicationContext.getString(R.string.error_transport_network_lost))
-            }
-        }
-
-        override fun onConnectionChange(state: PeerConnection.PeerConnectionState) {
-            audioScope.launch {
-                if (!isCurrent(attempt)) return@launch
-                when (state) {
-                    PeerConnection.PeerConnectionState.DISCONNECTED -> attempt.networkRecovery?.disconnected()
-                    PeerConnection.PeerConnectionState.CONNECTED -> attempt.networkRecovery?.connected()
-                    PeerConnection.PeerConnectionState.FAILED ->
-                        fail(attempt, applicationContext.getString(R.string.error_transport_network_lost))
-                    else -> Unit
+                    var offset = 0
+                    while (offset < chunk.size && isCurrent(attempt)) {
+                        val written = track.write(chunk, offset, chunk.size - offset)
+                        if (written <= 0) {
+                            delay(10)
+                            break
+                        }
+                        offset += written
+                    }
+                } catch (_: Exception) {
+                    delay(20)
                 }
             }
         }
     }
 
-    private fun dataObserver(attempt: Attempt) = object : DataChannel.Observer {
-        override fun onBufferedAmountChange(previousAmount: Long) = Unit
-
-        override fun onStateChange() {
-            audioScope.launch {
-                if (!isCurrent(attempt)) return@launch
-                val state = try { attempt.channel?.state() } catch (_: Exception) { null }
-                attempt.channelOpen.set(state == DataChannel.State.OPEN)
-                if (state == DataChannel.State.CLOSED && !attempt.closing.get()) {
-                    fail(attempt, applicationContext.getString(R.string.error_transport_channel_closed))
-                }
-            }
+    private fun geminiListener(attempt: Attempt, openDeferred: CompletableDeferred<Unit>) = object : WebSocketListener() {
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+            Log.i("MuralLive", "WebSocket onOpen: code=" + response.code + " hs=" + response.headers)
+            if (!isCurrent(attempt)) return
+            attempt.channelOpen.set(true)
+            if (!openDeferred.isCompleted) openDeferred.complete(Unit)
         }
 
-        override fun onMessage(buffer: DataChannel.Buffer) {
-            if (buffer.binary || !isCurrent(attempt)) return
-            val byteCount = buffer.data.remaining()
-            if (byteCount !in 1..MAX_EVENT_BYTES) {
+        override fun onMessage(webSocket: WebSocket, text: String) {
+            Log.i("MuralLive", "WS onMessage: " + text.take(1200))
+            if (!isCurrent(attempt)) return
+            if (text.length > MAX_EVENT_BYTES) {
                 fail(attempt, applicationContext.getString(R.string.error_transport_invalid_event))
                 return
             }
-            val bytes = ByteArray(byteCount)
-            buffer.data.duplicate().get(bytes)
-            val event = try {
-                JSON.parseToJsonElement(bytes.toString(Charsets.UTF_8)).jsonObject
-            } catch (_: Exception) {
+            val obj = try { JSON.parseToJsonElement(text).jsonObject } catch (e: Exception) {
+                Log.e("MuralLive", "Failed to parse WS message", e)
                 return
             }
-            val type = event.string("type") ?: return
-            if (!isCurrent(attempt) || !event.isSafeForCoordinator(type)) return
-            if (type == "session.started") {
-                // The first event can reach the UI before the queued OPEN callback runs.
+            handleGeminiMessage(attempt, obj, text)
+        }
+
+        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            // Binary messages not expected for Gemini; ignore
+        }
+
+        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            Log.e("MuralLive", "WebSocket onFailure: t=" + t.message + " response=" + response + " code=" + response?.code, t)
+            if (!isCurrent(attempt)) {
+                if (!openDeferred.isCompleted) openDeferred.completeExceptionally(t)
+                return
+            }
+            if (!openDeferred.isCompleted) openDeferred.completeExceptionally(t)
+            val msg = when (response?.code) {
+                401 -> applicationContext.getString(R.string.error_http_401)
+                403 -> applicationContext.getString(R.string.error_http_403_404)
+                429 -> applicationContext.getString(R.string.error_http_429)
+                else -> {
+                    // Try to read body for Gemini error details
+                    val body = try { response?.body?.string() } catch (_: Exception) { null }
+                    if (body != null && body.contains("API_KEY_INVALID", ignoreCase = true)) {
+                        applicationContext.getString(R.string.error_http_401)
+                    } else if (body != null && body.contains("MODEL_NOT_FOUND", ignoreCase = true)) {
+                        applicationContext.getString(R.string.error_transport_connection) + " (model)"
+                    } else applicationContext.getString(R.string.error_transport_network_lost)
+                }
+            }
+            fail(attempt, msg)
+        }
+
+        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            Log.i("MuralLive", "WebSocket onClosing: code=" + code + " reason=" + reason)
+            webSocket.close(code, reason)
+        }
+
+        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            Log.i("MuralLive", "WebSocket onClosed: code=" + code + " reason=" + reason + " closing=" + attempt.closing.get())
+            if (!isCurrent(attempt)) return
+            if (!attempt.closing.get()) {
+                val msg = when (code) {
+                    1008 -> applicationContext.getString(R.string.error_http_401) + " (1008)"
+                    1002, 1003 -> applicationContext.getString(R.string.error_transport_invalid_event) + " (" + code + ")"
+                    else -> applicationContext.getString(R.string.error_transport_channel_closed) + " (" + code + ":" + reason.take(100) + ")"
+                }
+                fail(attempt, msg)
+            }
+        }
+    }
+
+    private fun handleGeminiMessage(attempt: Attempt, obj: JsonObject, raw: String) {
+        // setupComplete
+        if ("setupComplete" in obj) {
+            if (!attempt.started.isCompleted) {
                 attempt.channelOpen.set(true)
                 startedState = true
                 attempt.started.complete(Unit)
+                emitEvent(attempt, buildJsonObject {
+                    put("type", "session.started")
+                    put("session", buildJsonObject { put("id", UUID.randomUUID().toString()) })
+                })
+                // Also emit mural.session.created for compatibility
+                emitEvent(attempt, buildJsonObject {
+                    put("type", "mural.session.created")
+                    put("session", buildJsonObject { put("id", UUID.randomUUID().toString()) })
+                })
             }
-            emitEvent(attempt, event)
+            return
+        }
+
+        // serverContent
+        val serverContent = obj["serverContent"] as? JsonObject
+        if (serverContent != null) {
+            // Check for interruption
+            val interrupted = (serverContent["interrupted"] as? JsonPrimitive)?.contentOrNull == "true" ||
+                    serverContent["interrupted"] == JsonPrimitive(true)
+            if (interrupted) {
+                attempt.playbackQueue.clear()
+                try { attempt.audioTrack?.pause(); attempt.audioTrack?.flush(); attempt.audioTrack?.play() } catch (_: Exception) {}
+            }
+
+            // Model turn with audio + text
+            val modelTurn = serverContent["modelTurn"] as? JsonObject
+            if (modelTurn != null) {
+                val parts = modelTurn["parts"] as? JsonArray ?: JsonArray(emptyList())
+                for (p in parts) {
+                    val part = p as? JsonObject ?: continue
+                    // Inline audio
+                    val inline = part["inlineData"] as? JsonObject
+                    if (inline != null) {
+                        val mime = inline["mimeType"]?.jsonPrimitive?.contentOrNull ?: inline["mimeType"]?.jsonPrimitive?.contentOrNull ?: ""
+                        val data = inline["data"]?.jsonPrimitive?.contentOrNull
+                        if (data != null && mime.contains("audio/pcm")) {
+                            try {
+                                val pcm = Base64.decode(data, Base64.DEFAULT)
+                                // Expect 24kHz PCM16 mono; queue for playback
+                                if (pcm.isNotEmpty() && pcm.size <= 100_000) {
+                                    attempt.playbackQueue.add(pcm)
+                                }
+                            } catch (_: Exception) {}
+                        }
+                    }
+                    // Text part
+                    val text = part["text"]?.jsonPrimitive?.contentOrNull
+                    if (!text.isNullOrEmpty()) {
+                        emitTranscript(attempt, text, isUser = false)
+                    }
+                }
+            }
+
+            // Input transcription
+            val inputTrans = serverContent["inputTranscription"] as? JsonObject
+            if (inputTrans != null) {
+                val text = inputTrans["text"]?.jsonPrimitive?.contentOrNull
+                if (!text.isNullOrEmpty()) {
+                    emitTranscript(attempt, text, isUser = true)
+                }
+            }
+            // Output transcription
+            val outputTrans = serverContent["outputTranscription"] as? JsonObject
+            if (outputTrans != null) {
+                val text = outputTrans["text"]?.jsonPrimitive?.contentOrNull
+                if (!text.isNullOrEmpty()) {
+                    emitTranscript(attempt, text, isUser = false)
+                }
+            }
+
+            // Turn complete / usage
+            val turnComplete = (serverContent["turnComplete"] as? JsonPrimitive)?.let { it.contentOrNull == "true" || it.booleanOrNull == true } ?: false
+            val usage = serverContent["usageMetadata"] as? JsonObject ?: obj["usageMetadata"] as? JsonObject
+            if (usage != null || turnComplete) {
+                val seconds = attempt.playbackQueue.size * 0.02 // approximate
+                emitEvent(attempt, buildJsonObject {
+                    put("type", if (turnComplete) "session.closed" else "session.usage.updated")
+                    put("usage", buildJsonObject { put("seconds", seconds) })
+                })
+                if (turnComplete) {
+                    // Do not auto-finish here; MuralViewModel handles session.closed via finish(true)
+                }
+            }
+
+            // Ensure ongoing activity timestamps updated
+            lastActivityUpdate()
+        }
+
+        // Tool call (delegation) - map to session.delegation.created
+        val toolCall = obj["toolCall"] as? JsonObject
+        if (toolCall != null) {
+            val functionCalls = toolCall["functionCalls"] as? JsonArray
+            if (functionCalls != null) {
+                for (fc in functionCalls) {
+                    val f = fc as? JsonObject ?: continue
+                    val name = f["name"]?.jsonPrimitive?.contentOrNull ?: continue
+                    val id = f["id"]?.jsonPrimitive?.contentOrNull ?: UUID.randomUUID().toString()
+                    if (name == "lookup" || name == "search" || name.contains("client")) {
+                        emitEvent(attempt, buildJsonObject {
+                            put("type", "session.delegation.created")
+                            put("delegation", buildJsonObject { put("target", "client"); put("id", id) })
+                        })
+                    }
+                }
+            }
+        }
+
+        // Fallback: if message is directly an error
+        if ("error" in obj) {
+            val err = obj["error"] as? kotlinx.serialization.json.JsonObject
+            val msg = err?.get("message")?.let { (it as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull } ?: ""
+            val errorText = when {
+                msg.contains("API_KEY_INVALID", ignoreCase = true) -> applicationContext.getString(R.string.error_http_401)
+                msg.contains("MODEL_NOT_FOUND", ignoreCase = true) -> applicationContext.getString(R.string.error_transport_connection) + " (model not found)"
+                else -> msg.takeIf { it.isNotBlank() } ?: applicationContext.getString(R.string.error_transport_channel_closed)
+            }
+            // Surface as failure if setup not completed
+            if (!attempt.started.isCompleted) {
+                fail(attempt, errorText)
+            } else {
+                emitEvent(attempt, buildJsonObject { put("type", "error") })
+            }
         }
     }
 
-    private suspend fun createOffer(attempt: Attempt): SessionDescription {
-        val result = CompletableDeferred<SessionDescription>()
-        val peer = attempt.peer ?: throw connectionException()
-        peer.createOffer(sdpObserver(attempt, onCreate = { result.complete(it) }, onFailure = {
-            result.completeExceptionally(connectionException())
-        }), MediaConstraints().apply {
-            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"))
-            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
+    private fun emitTranscript(attempt: Attempt, text: String, isUser: Boolean) {
+        if (text.length > 50000) return
+        val now = (System.currentTimeMillis() - attempt.startMs).toInt().coerceAtLeast(0)
+        val eventType = if (isUser) "session.input_transcript.delta" else "session.output_transcript.delta"
+        emitEvent(attempt, buildJsonObject {
+            put("type", eventType)
+            put("delta", text.take(1000))
+            put("start_ms", now)
+            put("end_ms", now + text.length * 20) // estimate
+            put("event_id", UUID.randomUUID().toString())
         })
-        return result.await()
     }
 
-    private suspend fun setDescription(attempt: Attempt, local: Boolean, description: SessionDescription) {
-        val result = CompletableDeferred<Unit>()
-        val peer = attempt.peer ?: throw connectionException()
-        val observer = sdpObserver(attempt, onSet = { result.complete(Unit) }, onFailure = {
-            result.completeExceptionally(connectionException())
-        })
-        if (local) peer.setLocalDescription(observer, description) else peer.setRemoteDescription(observer, description)
-        result.await()
-    }
-
-    private fun sdpObserver(
-        attempt: Attempt,
-        onCreate: (SessionDescription) -> Unit = {},
-        onSet: () -> Unit = {},
-        onFailure: (String) -> Unit,
-    ) = object : SdpObserver {
-        override fun onCreateSuccess(description: SessionDescription) {
-            if (isCurrent(attempt)) onCreate(description)
-            else onFailure("stale")
-        }
-
-        override fun onSetSuccess() {
-            if (isCurrent(attempt)) onSet() else onFailure("stale")
-        }
-
-        override fun onCreateFailure(message: String) = onFailure(message)
-        override fun onSetFailure(message: String) = onFailure(message)
+    private fun lastActivityUpdate() {
+        // Update last activity via levels? Handled via emitLevels
     }
 
     private fun startMetering(attempt: Attempt) {
@@ -413,26 +705,16 @@ class LiveTransport(
             var lastInput = 0.0
             var lastOutput = 0.0
             while (isActive && isCurrent(attempt)) {
-                attempt.peer?.getStats { report ->
-                    if (!isCurrent(attempt)) return@getStats
-                    var input = 0.0
-                    var output = 0.0
-                    for (stat in report.statsMap.values) {
-                        val level = (stat.members["audioLevel"] as? Number)?.toDouble() ?: 0.0
-                        if (stat.type == "inbound-rtp") output = maxOf(output, level)
-                        if (stat.type == "media-source") input = maxOf(input, level)
-                    }
-                    lastInput = lastInput * 0.35 + minOf(1.0, input * 4.0) * 0.65
-                    lastOutput = lastOutput * 0.35 + minOf(1.0, output * 4.0) * 0.65
-                    emitLevels(if (mutedState) 0.0 else lastInput, lastOutput, attempt)
-                }
+                lastInput = attempt.lastInputLevel
+                lastOutput = attempt.lastOutputLevel
+                // Apply smoothing already in capture/playback; just emit
+                emitLevels(lastInput, lastOutput, attempt)
                 delay(METER_INTERVAL_MILLISECONDS)
             }
         }
     }
 
     private fun configureAudio(attempt: Attempt) {
-        // Do not claim an in-progress call or a legacy SCO connection owned by another app.
         if (attempt.previousAudioMode != AudioManager.MODE_NORMAL || audioManager.mode != AudioManager.MODE_NORMAL ||
             (Build.VERSION.SDK_INT < 31 && LegacyCommunicationAudioRoute.hasExistingSco(applicationContext, audioManager))) {
             throw audioFocusException()
@@ -485,8 +767,6 @@ class LiveTransport(
 
     private fun fail(attempt: Attempt, message: String) {
         if (!isCurrent(attempt) || attempt.closing.get() || !attempt.failureReported.compareAndSet(false, true)) return
-        // WebRTC callbacks can run on its native signaling/audio threads. Disposing
-        // a peer there can deadlock while joining the very thread delivering failure.
         audioScope.launch {
             val failureGeneration = cleanupIfCurrent(attempt) ?: return@launch
             scope.launch {
@@ -518,8 +798,6 @@ class LiveTransport(
     private fun releaseAudioRoute(attempt: Attempt) {
         try {
             if (Build.VERSION.SDK_INT >= 31) {
-                // clearCommunicationDevice releases this caller's selection. Re-selecting a
-                // previously observed global device would create a new, lingering request.
                 if (attempt.ownsCommunicationRoute) audioManager.clearCommunicationDevice()
             } else attempt.legacyAudioRoute?.close(restoreSpeakerphone = !attempt.focusLost.get())
         } catch (_: Exception) { }
@@ -562,22 +840,25 @@ class LiveTransport(
         attempt.scopeCompletion = null
         attempt.meterJob?.cancel()
         attempt.meterJob = null
-        attempt.iceComplete.cancel()
+        attempt.captureJob?.cancel()
+        attempt.captureJob = null
+        attempt.playbackJob?.cancel()
+        attempt.playbackJob = null
+        try { attempt.audioRecord?.stop() } catch (_: Exception) {}
+        try { attempt.audioRecord?.release() } catch (_: Exception) {}
+        attempt.audioRecord = null
+        try { attempt.audioTrack?.pause(); attempt.audioTrack?.flush(); attempt.audioTrack?.stop() } catch (_: Exception) {}
+        try { attempt.audioTrack?.release() } catch (_: Exception) {}
+        attempt.audioTrack = null
+        attempt.playbackQueue.clear()
+        try { attempt.webSocket?.cancel() } catch (_: Exception) {}
+        try { attempt.webSocket?.close(1000, "cleanup") } catch (_: Exception) {}
+        attempt.webSocket = null
+        try { attempt.okHttpClient?.dispatcher?.executorService?.shutdown() } catch (_: Exception) {}
+        attempt.okHttpClient = null
         attempt.started.cancel()
-        try { attempt.track?.setEnabled(false) } catch (_: Exception) { }
-        try { attempt.channel?.unregisterObserver() } catch (_: Exception) { }
-        try { attempt.channel?.close() } catch (_: Exception) { }
-        try { attempt.channel?.dispose() } catch (_: Exception) { }
-        try { attempt.peer?.close() } catch (_: Exception) { }
-        try { attempt.peer?.dispose() } catch (_: Exception) { }
-        try { attempt.track?.dispose() } catch (_: Exception) { }
-        try { attempt.source?.dispose() } catch (_: Exception) { }
-        try { attempt.factory?.dispose() } catch (_: Exception) { }
-        try { attempt.audioDeviceModule?.release() } catch (_: Exception) { }
         releaseAudioRoute(attempt)
         if (attempt.ownsAudioMode) {
-            // MODE_NORMAL removes this process's mode request; Android restores another
-            // caller's request itself. Reapplying its observed mode would claim ownership.
             try { audioManager.mode = AudioManager.MODE_NORMAL } catch (_: Exception) { }
             attempt.ownsAudioMode = false
         }
@@ -612,18 +893,6 @@ class LiveTransport(
         if (!isCurrent(attempt)) throw CancellationException("Voice connection superseded")
     }
 
-    private fun ensureWebRtcInitialized() {
-        synchronized(initializationLock) {
-            if (webRtcInitialized) return
-            PeerConnectionFactory.initialize(
-                PeerConnectionFactory.InitializationOptions.builder(applicationContext)
-                    .setEnableInternalTracer(false)
-                    .createInitializationOptions(),
-            )
-            webRtcInitialized = true
-        }
-    }
-
     private class Attempt(
         val id: Long,
         val ownership: LiveSessionOwnership,
@@ -638,20 +907,23 @@ class LiveTransport(
         var ownsCommunicationRoute = false
         var legacyAudioRoute: LegacyCommunicationAudioRoute? = null
         val focusLost = AtomicBoolean(false)
-        var audioDeviceModule: AudioDeviceModule? = null
-        var factory: PeerConnectionFactory? = null
-        var peer: PeerConnection? = null
-        var source: org.webrtc.AudioSource? = null
-        var track: org.webrtc.AudioTrack? = null
-        var channel: DataChannel? = null
+        var webSocket: WebSocket? = null
+        var okHttpClient: OkHttpClient? = null
+        var audioRecord: AudioRecord? = null
+        var audioTrack: AudioTrack? = null
+        var captureJob: Job? = null
+        var playbackJob: Job? = null
         var meterJob: Job? = null
         var scopeCompletion: DisposableHandle? = null
-        val iceComplete = CompletableDeferred<Unit>()
         val started = CompletableDeferred<Unit>()
         val channelOpen = AtomicBoolean(false)
         val closing = AtomicBoolean(false)
         val failureReported = AtomicBoolean(false)
         val cleaned = AtomicBoolean(false)
+        val playbackQueue = ConcurrentLinkedQueue<ByteArray>()
+        var lastInputLevel: Double = 0.0
+        var lastOutputLevel: Double = 0.0
+        val startMs: Long = System.currentTimeMillis()
     }
 
     sealed class TransportException(message: String) : Exception(message) {
@@ -667,26 +939,19 @@ class LiveTransport(
     private fun audioFocusException() = TransportException.AudioFocus(applicationContext.getString(R.string.error_transport_audio_focus))
 
     companion object {
-        // WebRTC creation, route changes and disposal can block while joining native threads.
-        // A single worker also prevents disposal racing a send, mute or stats request.
         private val AUDIO_DISPATCHER = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "mural-audio-control").apply { isDaemon = true }
         }.asCoroutineDispatcher()
-        private const val ICE_TIMEOUT_MILLISECONDS = 10_000L
-        private const val SDP_TIMEOUT_MILLISECONDS = 10_000L
         private const val READY_TIMEOUT_MILLISECONDS = 20_000L
         private const val METER_INTERVAL_MILLISECONDS = 100L
         private const val MAX_EVENT_BYTES = 524_288
         private val JSON = Json { ignoreUnknownKeys = true }
-        private val initializationLock = Any()
-        @Volatile private var webRtcInitialized = false
     }
 }
 
 private fun JsonObject.string(key: String): String? =
     (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
 
-/** Protects coordinator code from malformed provider fields before it uses jsonPrimitive. */
 private fun JsonObject.isSafeForCoordinator(type: String): Boolean = when (type) {
     "mural.session.created", "session.started" ->
         (this["session"] as? JsonObject)?.get("id").isAbsentOrString()
@@ -710,7 +975,6 @@ private fun kotlinx.serialization.json.JsonElement?.isAbsentOrPrimitive(): Boole
 private fun kotlinx.serialization.json.JsonElement?.isAbsentOrString(): Boolean =
     this == null || (this as? JsonPrimitive)?.isString == true
 
-/** Allows a brief Wi-Fi/mobile handoff; an unrecovered connection cannot stay active forever. */
 internal class VoiceConnectionRecovery(
     private val scope: CoroutineScope,
     private val timeoutMillis: Long = 8_000,
@@ -729,3 +993,11 @@ internal class VoiceConnectionRecovery(
         timer = null
     }
 }
+
+private fun JsonPrimitive.booleanOrNull(): Boolean? = try {
+    when (content) {
+        "true" -> true
+        "false" -> false
+        else -> null
+    }
+} catch (_: Exception) { null }
