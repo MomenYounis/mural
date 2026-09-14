@@ -11,6 +11,45 @@
 
 Mural is a native iPhone and Android app for learning through conversation. Speak to a warm, animated orb, follow the meaning when you need it, and practise words again in later conversations. Mural adjusts the challenge from the evidence in your replies.
 
+## 🔀 هذا الفورك — Gemini Live Migration
+
+> **Fork من [Chuloo/mural](https://github.com/Chuloo/mural) — تم نقل طبقة الصوت/الشبكات في أندرويد من OpenAI Realtime WebRTC إلى Google Gemini**
+
+**فرع العمل:** `gemini-live-migration` → https://github.com/MomenYounis/mural/tree/gemini-live-migration
+
+### ايه اللي اتعمل؟
+
+| الملف | قبل (OpenAI) | بعد (Gemini) |
+|---|---|---|
+| `LiveTransport.kt` | `PeerConnectionFactory` + `DataChannel "oai-events"` + SDP إلى `api.openai.com/v1/live/sessions` (model `gpt-live-1`) | `OkHttp WebSocket` إلى `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=YOUR_API_KEY` |
+| Audio | WebRTC `JavaAudioDeviceModule` | `AudioRecord` 16kHz mono PCM16 (base64 في `realtimeInput { audio: { mimeType: "audio/pcm;rate=16000", data } }` كل 20ms) → `AudioTrack` 24kHz PCM16 مع queue بدون تقطيع + RMS metering |
+| `APIClient.kt` | `POST https://api.openai.com/v1/responses` بـ `gpt-5.6-luna` | `POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=KEY` مع `system_instruction` + `google_search` → parse `candidates[].content.parts[].text` + `groundingChunks` |
+| `CredentialStore.kt` | `mural_openai_credentials` / `chat.mural.openai.aes` يقبل `sk-...` | `mural_gemini_credentials` / `chat.mural.gemini.aes` يقبل `AIza...` / `AQ...` (>=20 حرف، يرفض `sk-`) عبر Android Keystore `AES/GCM/NoPadding` |
+| `SettingsScreen.kt` + `strings.xml` | لينكات `platform.openai.com` | `aistudio.google.com/app/apikey` + `ai.google.dev/gemini-api/docs/billing` + `Voice: Gemini Live 2.5 Flash` |
+| `build.gradle.kts` | `io.github.webrtc-sdk:android:150.7871.01` | محذوفة (WebSocket فقط) |
+| `NativeCompatibilityTest.kt` | اختبار WebRTC offer | اختبار URL الـ WebSocket + AudioTrack/Record |
+
+**البناء:**
+```sh
+export JAVA_HOME=/usr/lib/jvm/java-17-temurin-jdk
+export ANDROID_HOME=~/Android/Sdk
+cd apps/android
+./gradlew :app:assembleDebug   # ✅ 37 tasks, APK 15MB
+./gradlew :app:testDebugUnitTest # ✅ 24 tasks
+```
+APK: `apps/android/app/build/outputs/apk/debug/app-debug.apk`
+
+**تجربة على جهاز حقيقي (adb):**
+- `adb install -r app-debug.apk` → WebSocket 101، `setup { model: "models/gemini-2.5-flash-native-audio-preview-09-2025", generationConfig { responseModalities: ["AUDIO"] ... } }` → `setupComplete`،
+- صلحت `camelCase` (`generation_config` → `generationConfig`) وشيلت `language_code` اللي كانت ترجع `1007 Invalid JSON`،
+- إضافة header `x-goog-api-key` + `?key=` لدعم مفاتيح `AQ.` الجديدة،
+- رسالة الخطأ القديمة `The voice connection ended unexpectedly` بقت `Your Google Gemini API key wasn't accepted` عند `1008`.
+
+**اللي فاضل:** تفعيل `Generative Language API` + `Billing` للمشروع `gen-lang-client-0507182628` (كل المفاتيح لسه `Set up billing` → `API_KEY_SERVICE_BLOCKED`).
+
+---
+
+
 Built with SwiftUI and Liquid Glass on iPhone, and Jetpack Compose on Android. Learning records stay on your device. This version connects directly to OpenAI using your own API key. It needs an internet connection, but no Mural account or running Mac.
 
 ## Android
